@@ -1,0 +1,165 @@
+diff --git a/cli.py b/cli.py
+index f26ff8c3..fe3a2881 100644
+--- a/cli.py
++++ b/cli.py
+@@ -2518,6 +2518,27 @@ class HermesCLI:
+                         frags.append(("class:status-bar-dim", prompt_elapsed))
+                     frags.append(("class:status-bar", " "))
+ 
++            try:
++                from hermes_cli.plugins import get_plugin_status_items
++
++                for item in get_plugin_status_items():
++                    callback = item.get("callback")
++                    if not callable(callback):
++                        continue
++                    rendered = callback(cli=self, snapshot=snapshot, width=width)
++                    if not rendered:
++                        continue
++                    if isinstance(rendered, str):
++                        plugin_frags = [("class:status-bar-dim", rendered)]
++                    else:
++                        plugin_frags = list(rendered)
++                    if not plugin_frags:
++                        continue
++                    frags.append(("class:status-bar-dim", " │ "))
++                    frags.extend(plugin_frags)
++            except Exception:
++                pass
++
+             total_width = sum(self._status_bar_display_width(text) for _, text in frags)
+             if total_width > width:
+                 plain_text = "".join(text for _, text in frags)
+diff --git a/hermes_cli/plugins.py b/hermes_cli/plugins.py
+index 7eb9a400..9e30b517 100644
+--- a/hermes_cli/plugins.py
++++ b/hermes_cli/plugins.py
+@@ -449,6 +449,36 @@ class PluginContext:
+         self._manager._hooks.setdefault(hook_name, []).append(callback)
+         logger.debug("Plugin %s registered hook: %s", self.manifest.name, hook_name)
+ 
++    # -- status bar registration -------------------------------------------
++
++    def register_status_item(
++        self,
++        name: str,
++        callback: Callable,
++        priority: int = 100,
++    ) -> None:
++        """Register a CLI status-bar item.
++
++        The callback is called by the interactive CLI footer renderer with
++        keyword context such as ``cli``, ``snapshot`` and ``width``. It may
++        return either a prompt_toolkit fragment list ``[(style, text), ...]``
++        or a plain string. Lower priority values render earlier.
++        """
++        clean = name.lower().strip().replace(" ", "-")
++        if not clean:
++            logger.warning(
++                "Plugin '%s' tried to register a status item with an empty name.",
++                self.manifest.name,
++            )
++            return
++        self._manager._status_items[clean] = {
++            "name": clean,
++            "callback": callback,
++            "priority": int(priority),
++            "plugin": self.manifest.name,
++        }
++        logger.debug("Plugin %s registered status item: %s", self.manifest.name, clean)
++
+     # -- skill registration -------------------------------------------------
+ 
+     def register_skill(
+@@ -511,6 +541,7 @@ class PluginManager:
+         self._cli_commands: Dict[str, dict] = {}
+         self._context_engine = None  # Set by a plugin via register_context_engine()
+         self._plugin_commands: Dict[str, dict] = {}  # Slash commands registered by plugins
++        self._status_items: Dict[str, dict] = {}  # CLI status bar items registered by plugins
+         self._discovered: bool = False
+         self._cli_ref = None  # Set by CLI after plugin discovery
+         # Plugin skill registry: qualified name → metadata dict.
+@@ -535,6 +566,7 @@ class PluginManager:
+             self._plugin_tool_names.clear()
+             self._cli_commands.clear()
+             self._plugin_commands.clear()
++            self._status_items.clear()
+             self._plugin_skills.clear()
+             self._context_engine = None
+         self._discovered = True
+@@ -987,6 +1019,13 @@ class PluginManager:
+                 )
+         return results
+ 
++    def get_status_items(self) -> List[dict]:
++        """Return registered CLI status-bar items ordered by priority."""
++        return sorted(
++            self._status_items.values(),
++            key=lambda item: (item.get("priority", 100), item.get("name", "")),
++        )
++
+     # -----------------------------------------------------------------------
+     # Introspection
+     # -----------------------------------------------------------------------
+@@ -1137,6 +1176,11 @@ def get_plugin_commands() -> Dict[str, dict]:
+     return _ensure_plugins_discovered()._plugin_commands
+ 
+ 
++def get_plugin_status_items() -> List[dict]:
++    """Return plugin-registered CLI status-bar items ordered by priority."""
++    return _ensure_plugins_discovered().get_status_items()
++
++
+ def get_plugin_toolsets() -> List[tuple]:
+     """Return plugin toolsets as ``(key, label, description)`` tuples.
+ 
+diff --git a/tests/cli/test_cli_status_bar.py b/tests/cli/test_cli_status_bar.py
+index 4a65c6e4..98ec9ac7 100644
+--- a/tests/cli/test_cli_status_bar.py
++++ b/tests/cli/test_cli_status_bar.py
+@@ -368,6 +368,21 @@ class TestStatusBarWidthSource:
+                 f"({total_text!r})"
+             )
+ 
++    def test_plugin_status_fragments_are_appended(self):
++        """Plugin status items are appended to the normal CLI status bar."""
++        from unittest.mock import MagicMock, patch
++        cli_obj = self._make_wide_cli()
++
++        mock_app = MagicMock()
++        mock_app.output.get_size.return_value = MagicMock(columns=160)
++        with patch("prompt_toolkit.application.get_app", return_value=mock_app), \
++             patch("hermes_cli.plugins.get_plugin_status_items", return_value=[
++                 {"name": "claude-memories", "callback": lambda **kw: [("class:status-bar-dim", " 🧠 Claude 2")]},
++             ]):
++            frags = cli_obj._get_status_bar_fragments()
++
++        assert "🧠 Claude 2" in "".join(text for _, text in frags)
++
+     def test_fragments_use_pt_width_over_shutil(self):
+         """When prompt_toolkit reports a width, shutil.get_terminal_size must not be used."""
+         from unittest.mock import MagicMock, patch
+diff --git a/tests/hermes_cli/test_plugins.py b/tests/hermes_cli/test_plugins.py
+index 157f967e..ca2f8e80 100644
+--- a/tests/hermes_cli/test_plugins.py
++++ b/tests/hermes_cli/test_plugins.py
+@@ -407,6 +407,19 @@ class TestPluginHooks:
+         assert len(results) == 1
+         assert results[0] == {"context": "memory from plugin"}
+ 
++    def test_status_item_registration_orders_by_priority(self):
++        """Plugins can register status bar items for the CLI footer."""
++        mgr = PluginManager()
++        ctx = PluginContext(PluginManifest(name="status-plugin", source="user"), mgr)
++
++        ctx.register_status_item("later", lambda **kw: [("class:status-bar", " later")], priority=50)
++        ctx.register_status_item("earlier", lambda **kw: [("class:status-bar", " earlier")], priority=10)
++
++        items = mgr.get_status_items()
++
++        assert [item["name"] for item in items] == ["earlier", "later"]
++        assert items[0]["callback"]() == [("class:status-bar", " earlier")]
++
+     def test_hook_none_returns_excluded(self, tmp_path, monkeypatch):
+         """invoke_hook() excludes None returns from the result list."""
+         plugins_dir = tmp_path / "hermes_test" / "plugins"

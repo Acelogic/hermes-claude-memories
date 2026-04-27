@@ -1,0 +1,3 @@
+name: claude-memories
+version: "0.1.0"
+description: Read-only bridge from Claude Code MEMORY.md/CLAUDE.md files into Hermes sessions, with a CLI status-bar indicator.
