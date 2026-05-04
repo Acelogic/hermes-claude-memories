@@ -29,6 +29,7 @@ _cached: list[MemorySource] = []
 _force_inject_next = False
 _loaded_last_turn = False
 _last_cwd = ""
+_fallback_status_patch_installed = False
 
 
 def _current_cwd(ctx: Any = None) -> str:
@@ -58,6 +59,76 @@ def _status_fragments(**_kwargs):
         return []
     suffix = "✓" if _loaded_last_turn else "…" if _force_inject_next else ""
     return [("class:status-bar-dim", f"🧠 Claude {count}{suffix}")]
+
+
+def _coerce_status_fragments(rendered):
+    if not rendered:
+        return []
+    if isinstance(rendered, str):
+        return [("class:status-bar-dim", rendered)]
+    try:
+        return list(rendered)
+    except TypeError:
+        return []
+
+
+def _install_status_bar_fallback() -> bool:
+    """Patch the CLI footer at runtime when Hermes lacks status-item API.
+
+    The preferred path is Hermes core's ``ctx.register_status_item`` API.  A
+    ``hermes update`` can remove that local core patch, though; this fallback
+    lives in the user plugin directory and is loaded before ``cli.HermesCLI`` is
+    instantiated, so the Claude memory count survives updates even when the
+    core API disappears.
+    """
+    global _fallback_status_patch_installed
+    if _fallback_status_patch_installed:
+        return True
+    try:
+        import cli as hermes_cli_module
+
+        HermesCLI = getattr(hermes_cli_module, "HermesCLI")
+        original = getattr(HermesCLI, "_get_status_bar_fragments")
+        if getattr(original, "_claude_memories_fallback", False):
+            _fallback_status_patch_installed = True
+            return True
+
+        def patched_get_status_bar_fragments(self, *args, **kwargs):
+            frags = original(self, *args, **kwargs)
+            try:
+                if not frags:
+                    return frags
+                existing_text = "".join(text for _, text in frags)
+                if "🧠 Claude" in existing_text:
+                    return frags
+
+                width = self._get_tui_terminal_width()
+                snapshot = self._get_status_bar_snapshot()
+                plugin_frags = _coerce_status_fragments(
+                    _status_fragments(cli=self, snapshot=snapshot, width=width)
+                )
+                if not plugin_frags:
+                    return frags
+
+                out = list(frags)
+                out.append(("class:status-bar-dim", " │ "))
+                out.extend(plugin_frags)
+                total_width = sum(self._status_bar_display_width(text) for _, text in out)
+                if total_width > width:
+                    plain_text = "".join(text for _, text in out)
+                    trimmed = self._trim_status_bar_text(plain_text, width)
+                    return [("class:status-bar", trimmed)]
+                return out
+            except Exception:
+                return frags
+
+        patched_get_status_bar_fragments._claude_memories_fallback = True
+        patched_get_status_bar_fragments._claude_memories_original = original
+        HermesCLI._get_status_bar_fragments = patched_get_status_bar_fragments
+        _fallback_status_patch_installed = True
+        return True
+    except Exception:
+        return False
 
 
 def _pre_llm_call(**kwargs):
@@ -120,6 +191,8 @@ def register(ctx):
     ctx.register_hook("pre_llm_call", _pre_llm_call)
     if hasattr(ctx, "register_status_item"):
         ctx.register_status_item("claude-memories", _status_fragments, priority=80)
+    else:
+        _install_status_bar_fallback()
 
     ctx.register_command("memories-refresh", memories_refresh, "Rescan Claude Code memory locations", args_hint="[cwd]")
     ctx.register_command("memories-list", memories_list, "List cached Claude Code memory files")

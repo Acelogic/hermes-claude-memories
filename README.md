@@ -24,23 +24,26 @@ Suffixes:
 - `🧠 Claude 2…` — memories are queued for injection on the next turn
 - `🧠 Claude 2✓` — memories were injected on the last turn
 
-This requires the Hermes core plugin API:
+Preferred core API:
 
 ```python
 ctx.register_status_item(name, callback, priority=100)
 ```
 
-I added this API locally in `~/.hermes/hermes-agent` while developing this plugin. Older Hermes versions still load the plugin, but simply skip the status-bar item.
+This repo includes the paired Hermes core patch at `patches/hermes-status-items.patch`.
+If a future `hermes update` removes that local core patch, the plugin now installs a
+runtime fallback from `~/.hermes/plugins/claude-memories` that monkey-patches the
+interactive CLI footer during plugin load. That fallback is stored outside the Hermes
+source checkout, so the Claude memory count remains visible after updates even before
+the core patch is reapplied.
 
 ## Install locally
 
-This repo includes the paired Hermes core patch at `patches/hermes-status-items.patch`. It has already been applied to this machine's local Hermes checkout at `/Users/mcruz/.hermes/hermes-agent`.
-
-On a fresh Hermes checkout, apply the core patch first:
+On a fresh Hermes checkout, apply the core patch for the native status-item API:
 
 ```bash
 cd ~/.hermes/hermes-agent
-git apply ~/Developer/hermes-claude-memories/patches/hermes-status-items.patch
+git apply ~/.hermes/plugins/claude-memories/patches/hermes-status-items.patch
 ```
 
 Then install and enable the plugin:
